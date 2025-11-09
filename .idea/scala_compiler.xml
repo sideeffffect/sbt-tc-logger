@@ -1,8 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ScalaCompilerConfiguration">
-    <profile name="SBT 1" modules="logger,sbt-teamcity-logger">
+    <profile name="sbt 1" modules="sbt-github-actions-logger">
       <option name="deprecationWarnings" value="true" />
+      <parameters>
+        <parameter value="-Wconf:cat=unused-nowarn:s" />
+        <parameter value="-Xsource:3" />
+      </parameters>
     </profile>
   </component>
 </project>

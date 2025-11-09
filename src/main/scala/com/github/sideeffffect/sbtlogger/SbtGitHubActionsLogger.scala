@@ -1,0 +1,161 @@
+/*
+ * Copyright 2013-2021 JetBrains s.r.o.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ *
+ * You may obtain a copy of the License at
+ * http://www.apache.org/licenses/LICENSE-2.0.
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+ * either express or implied.
+ *
+ * See the License for the specific language governing permissions
+ * and limitations under the License.
+ */
+
+package com.github.sideeffffect.sbtlogger
+
+import sbt._
+import sbt.Keys._
+import sbt.sbtloggerhack.apiAdapter._
+import sbt.plugins.JvmPlugin
+
+import scala.collection.mutable
+
+object SbtGitHubActionsLogger extends AutoPlugin with (State => State) {
+
+  override def requires: Plugins = JvmPlugin
+  override def trigger: PluginTrigger = allRequirements
+
+  def apply(state: State): State = {
+    val sbtLoggerVersion = System.getProperty(GHA_LOGGER_PROPERTY_NAME)
+    if (sbtLoggerVersion == "reloaded") {
+      return state
+    }
+
+    // As seen in https://github.com/JetBrains/sbt-structure/blob/a65499070252b31bd4bf7cf79dbc8a1aa4e5830a/extractor/src/main/scala/org/jetbrains/sbt/operations.scala#L13
+    val extracted = Project.extract(state)
+    import extracted.{structure => extractedStructure, _}
+    val transformedProjectSettings = extractedStructure.allProjectRefs.flatMap { projectRef =>
+      transformSettings(projectScope(projectRef), projectRef.build, rootProject, SbtGitHubActionsLogger.projectSettings)
+    }
+    val transformedSession = session.appendRaw(transformedProjectSettings)
+    reapply(transformedSession, state)
+  }
+
+  // copied from sbt.internal.Load
+  private def transformSettings(
+      thisScope: Scope,
+      uri: URI,
+      rootProject: URI => String,
+      settings: Seq[Setting[_]],
+  ): Seq[Setting[_]] =
+    Project.transform(Scope.resolveScope(thisScope, uri, rootProject), settings)
+
+  // copied from sbt.internal.SessionSettings
+  private def reapply(session: SessionSettings, s: State): State =
+    BuiltinCommands.reapply(session, Project.structure(s), s)
+
+  lazy val tcLogAppender = new GHALogAppender()
+  lazy val tcLoggers: mutable.Map[String, GHALogger] = collection.mutable.Map[String, GHALogger]()
+  lazy val tcTestListener = new GHAReportListener(tcLogAppender)
+  lazy val startCompilationLogger: TaskKey[Unit] = TaskKey[Unit]("start-compilation-logger", "runs before compile")
+  lazy val startTestCompilationLogger: TaskKey[Unit] =
+    TaskKey[Unit]("start-test-compilation-logger", "runs before compile in test")
+  lazy val endCompilationLogger: TaskKey[Unit] = TaskKey[Unit]("end-compilation-logger", "runs after compile")
+  lazy val endTestCompilationLogger: TaskKey[Unit] =
+    TaskKey[Unit]("end-test-compilation-logger", "runs after compile in test")
+  lazy val tcEndCompilation: TaskKey[Unit] = TaskKey[Unit]("gha-end-compilation", "")
+  lazy val tcEndTestCompilation: TaskKey[Unit] = TaskKey[Unit]("gha-end-test-compilation", "")
+
+  val tcVersion: Option[String] = sys.env.get("GITHUB_ACTION")
+  val tcFound: Boolean = tcVersion.isDefined
+
+  val GHA_LOGGER_PROPERTY_NAME = "GITHUB_ACTIONS_SBT_LOGGER_VERSION"
+
+  val tcLoggerVersion: String = System.getProperty(GHA_LOGGER_PROPERTY_NAME)
+  if (tcLoggerVersion == null) {
+    System.setProperty(GHA_LOGGER_PROPERTY_NAME, "loaded")
+  } else if (tcLoggerVersion == "loaded") {
+    System.setProperty(GHA_LOGGER_PROPERTY_NAME, "reloaded")
+  }
+
+  var testResultLoggerFound = true
+
+  try {
+    val _: Def.Initialize[sbt.TestResultLogger] = Def.setting {
+      (testResultLogger in Test).value
+    }
+  } catch {
+    case _: java.lang.NoSuchMethodError =>
+      testResultLoggerFound = false
+  }
+
+  // noinspection TypeAnnotation,ConvertExpressionToSAM
+  override lazy val projectSettings =
+    if (tcFound && testResultLoggerFound)
+      loggerOnSettings ++ Seq(
+        testResultLogger in (Test, test) := new TestResultLogger {
+
+          import sbt.Tests._
+
+          def run(log: Logger, results: Output, taskName: String): Unit = {
+            // default behaviour there is
+            // TestResultLogger.SilentWhenNoTests.run(log, results, taskName)
+            // we will just ignore to prevent appearing of 'exit code 1' when test failed
+          }
+        },
+      )
+    else if (tcFound) loggerOnSettings
+    else loggerOffSettings
+
+  lazy val loggerOnSettings: Seq[Def.Setting[_]] = Seq(
+    commands += tcLoggerStatusCommand,
+    extraLoggers := {
+      val currentFunction: Def.ScopedKey[_] => Seq[ExtraLogger] = extraLoggers.value
+      key: ScopedKey[_] => {
+        val scope: String = getScopeId(key.scope.project)
+        val logger: ExtraLogger = extraLogger(tcLoggers, tcLogAppender, scope)
+
+        logger +: currentFunction(key)
+      }
+    },
+    testListeners += tcTestListener,
+    startCompilationLogger := tcLogAppender.compilationBlockStart(getScopeId(streams.value.key.scope.project)),
+    startTestCompilationLogger := tcLogAppender.compilationTestBlockStart(getScopeId(streams.value.key.scope.project)),
+    endCompilationLogger := tcLogAppender.compilationBlockEnd(getScopeId(streams.value.key.scope.project)),
+    endTestCompilationLogger := tcLogAppender.compilationTestBlockEnd(getScopeId(streams.value.key.scope.project)),
+    compile in Compile := ((compile in Compile) dependsOn startCompilationLogger).value,
+    compile in Test := ((compile in Test) dependsOn startTestCompilationLogger).value,
+    tcEndCompilation := (endCompilationLogger triggeredBy (compile in Compile)).value,
+    tcEndTestCompilation := (endTestCompilationLogger triggeredBy (compile in Test)).value,
+  ) ++
+    inConfig(Compile)(Seq(reporterSettings(tcLogAppender))) ++
+    inConfig(Test)(Seq(reporterSettings(tcLogAppender)))
+
+  lazy val loggerOffSettings: Seq[Def.Setting[_]] = Seq(
+    commands += tcLoggerStatusCommand,
+  )
+
+  def tcLoggerStatusCommand: Command = Command.command("sbt-github-actions-logger") { state =>
+    doCommand(state)
+  }
+
+  private def doCommand(state: State): State = {
+    println("Plugin sbt-github-actions-logger was loaded.")
+    val tcv = tcVersion.getOrElse("undefined")
+    if (tcFound) {
+      println(s"GitHub Action '$tcv'")
+    } else {
+      println(s"GitHub Actions was not discovered. Logger was switched off.")
+    }
+    state
+  }
+
+  private def getScopeId(scope: ScopeAxis[sbt.Reference]): String = {
+    "" + scope.hashCode()
+  }
+
+}
